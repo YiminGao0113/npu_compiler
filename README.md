@@ -1,33 +1,139 @@
+# NPU IREE Plugin – Complete Exploration Workflow
+
+This is the exact reproducible workflow used to validate the
+`lower-matmul-to-npu` preprocessing pass.
+
+Assumed directory layout:
+
+workspace/
+  iree/
+  npu_compiler/
+
+---
+
+## 0️⃣ Setup Environment (relative paths)
+
+From inside `workspace/`:
+
 ```bash
-export ROOT=/localsdd/yg9bq
-export NPU_COMPILER=$ROOT/npu_compiler
-export IREE_SRC=$ROOT/iree
-export IREE_BUILD=$ROOT/iree-build
-
-cd $ROOT
-git clone https://github.com/iree-org/iree.git
-cd $IREE_SRC
-git submodule update --init --recursive
-
-cmake -B $IREE_BUILD -S $IREE_SRC \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DIREE_BUILD_COMPILER=ON \
-  -DIREE_BUILD_TOOLS=ON \
-  -DIREE_BUILD_SAMPLES=OFF \
-  -DIREE_BUILD_TESTS=OFF \
-  -DIREE_INPUT_TOSA=OFF \
-  -DIREE_INPUT_TORCH=OFF \
-  -DIREE_INPUT_STABLEHLO=OFF \
-  -DIREE_HAL_DRIVER_DEFAULTS=OFF \
-  -DIREE_TARGET_BACKEND_DEFAULTS=OFF \
-  -DIREE_TARGET_BACKEND_LLVM_CPU=ON \
-  -DIREE_CMAKE_PLUGIN_PATHS=$NPU_COMPILER
-
-cmake --build $IREE_BUILD -j2 --target iree-compile
-
-$IREE_BUILD/tools/iree-compile \
-  $NPU_COMPILER/test/matmul_8xKx8.mlir \
-  --iree-preprocessing-pass-pipeline="builtin.module(func.func(lower-matmul-to-npu))" \
-  --compile-to=vm
-
+export WORKSPACE=$(pwd)
+export IREE_SRC=$WORKSPACE/iree
+export NPU_COMPILER=$WORKSPACE/npu_compiler
+export IREE_BUILD=$IREE_SRC/build
 ```
+
+---
+
+## 1️⃣ Clone IREE (if not already cloned)
+
+```bash
+git clone https://github.com/iree-org/iree.git
+```
+
+---
+
+## 2️⃣ Configure IREE with plugin (relative path)
+
+```bash
+cmake -G Ninja \
+  -B $IREE_BUILD \
+  -S $IREE_SRC \
+  -DIREE_CMAKE_PLUGIN_PATHS=$NPU_COMPILER
+```
+
+---
+
+## 3️⃣ Build iree-compile
+
+```bash
+ninja -C $IREE_BUILD tools/iree-compile
+```
+
+---
+
+## 4️⃣ Confirm Pass Is Linked
+
+```bash
+nm -C $IREE_BUILD/tools/iree-compile | grep LowerMatmulToNPUPass
+```
+
+You should see symbols for the pass.
+
+---
+
+## 5️⃣ Create 8x8x8 Test Matmul
+
+```bash
+cat > /tmp/test.mlir <<'EOF'
+module {
+  func.func @run(%a: tensor<8x8xi8>,
+                 %b: tensor<8x8xi8>,
+                 %c: tensor<8x8xi16>)
+      -> tensor<8x8xi16> {
+    %0 = linalg.matmul
+        ins(%a, %b : tensor<8x8xi8>, tensor<8x8xi8>)
+        outs(%c : tensor<8x8xi16>)
+        -> tensor<8x8xi16>
+    return %0 : tensor<8x8xi16>
+  }
+}
+EOF
+```
+
+---
+
+## 6️⃣ Run Preprocessing Only
+
+```bash
+$IREE_BUILD/tools/iree-compile \
+  /tmp/test.mlir \
+  --iree-preprocessing-pass-pipeline="builtin.module(lower-matmul-to-npu)" \
+  --iree-hal-target-device=local \
+  --iree-hal-local-target-device-backends=vmvx \
+  --compile-to=preprocessing \
+  -o /tmp/after_preprocess.mlir
+```
+
+Verify rewrite:
+
+```bash
+grep -n "npu.matmul_8x8x8" /tmp/after_preprocess.mlir
+```
+
+Expected:
+- `linalg.matmul` replaced by `func.call @npu.matmul_8x8x8`
+- Private declaration emitted
+
+---
+
+## 7️⃣ Run Full Pipeline to VM
+
+```bash
+$IREE_BUILD/tools/iree-compile \
+  /tmp/test.mlir \
+  --iree-preprocessing-pass-pipeline="builtin.module(lower-matmul-to-npu)" \
+  --iree-hal-target-device=local \
+  --iree-hal-local-target-device-backends=vmvx \
+  --compile-to=vm \
+  -o /tmp/after_vm.mlir
+```
+
+Verify VM import:
+
+```bash
+grep -n "vm.import" /tmp/after_vm.mlir
+```
+
+Expected:
+- `vm.call @npu.matmul_8x8x8`
+- `vm.import private @npu.matmul_8x8x8`
+
+---
+
+# What This Demonstrates
+
+• Custom preprocessing pass is registered  
+• `linalg.matmul` is intercepted  
+• Rewritten to `@npu.matmul_8x8x8`  
+• Rewrite survives full IREE lowering  
+• VM import generated (ready for runtime binding)

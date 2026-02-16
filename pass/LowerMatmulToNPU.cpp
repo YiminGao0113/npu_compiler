@@ -1,10 +1,16 @@
+// LowerMatmulToNPU.cpp
+// Phase-1: match linalg.matmul for EXACT 8x8x8 (i8*i8->i16) and REWRITE it to:
+//   %y = call @npu.matmul_8x8x8(%a, %b) : (tensor<8x8xi8>, tensor<8x8xi8>) -> tensor<8x8xi16>
+//
+// Also auto-inserts a private declaration for @npu.matmul_8x8x8 if missing.
+
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Diagnostics.h"
-#include "mlir/IR/Operation.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -13,38 +19,41 @@ using namespace mlir;
 namespace {
 
 struct LowerMatmulToNPUPass
-    : public PassWrapper<LowerMatmulToNPUPass, OperationPass<func::FuncOp>> {
+    : public PassWrapper<LowerMatmulToNPUPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerMatmulToNPUPass)
 
-  // Phase-0 “device” assumptions (only used for printing today).
-  static constexpr int kTileM = 8;
-  static constexpr int kTileN = 8;
-  static constexpr int kKGranularity = 8;  // K multiple of 8
+  // Phase-1 target: ONLY 8x8x8 for sanity.
+  static constexpr int64_t kM = 8;
+  static constexpr int64_t kN = 8;
+  static constexpr int64_t kK = 8;
   static constexpr int kBramWidthBits = 64;
 
   StringRef getArgument() const final { return "lower-matmul-to-npu"; }
   StringRef getDescription() const final {
-    return "Phase-0: recognize 8xKx8 linalg.matmul and print NPU dispatch record";
+    return "Phase-1: rewrite 8x8x8 linalg.matmul (i8xi8->i16) to call @npu.matmul_8x8x8";
   }
 
   void runOnOperation() override {
-    func::FuncOp func = getOperation();
+    ModuleOp module = getOperation();
 
-    // Walk all linalg.matmul ops in the function.
-    func.walk([&](linalg::MatmulOp op) {
-      // linalg.matmul has 2 inputs (A, B) and 1 output (C).
-      // We’ll require ranked tensor types for Phase 0.
+    // Important: rewriting while walking can invalidate iterators.
+    // Collect ops first, then rewrite.
+    SmallVector<linalg::MatmulOp, 8> matmuls;
+    module.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
+
+    for (linalg::MatmulOp op : matmuls) {
+      // Require ranked tensors.
       auto aTy = dyn_cast<RankedTensorType>(op.getInputs()[0].getType());
       auto bTy = dyn_cast<RankedTensorType>(op.getInputs()[1].getType());
       auto cTy = dyn_cast<RankedTensorType>(op.getOutputs()[0].getType());
 
       if (!aTy || !bTy || !cTy) {
-        op.emitError("Phase-0 NPU expects ranked tensor types for matmul operands");
+        op.emitError("NPU expects ranked tensor types for matmul operands");
         signalPassFailure();
         return;
       }
       if (aTy.getRank() != 2 || bTy.getRank() != 2 || cTy.getRank() != 2) {
-        op.emitError("Phase-0 NPU expects 2D tensors for matmul");
+        op.emitError("NPU expects 2D tensors for matmul");
         signalPassFailure();
         return;
       }
@@ -58,19 +67,19 @@ struct LowerMatmulToNPUPass
       int64_t N_c = cTy.getDimSize(1);
 
       auto fail = [&](StringRef msg) {
-        op.emitError() << msg
-                       << " (got A=[" << M << "x" << K_a
-                       << "], B=[" << K_b << "x" << N
-                       << "], C=[" << M_c << "x" << N_c << "])";
+        op.emitError()
+            << msg
+            << " (got A=[" << M << "x" << K_a
+            << "], B=[" << K_b << "x" << N
+            << "], C=[" << M_c << "x" << N_c << "])";
         signalPassFailure();
       };
 
-      // Must be statically known for Phase 0.
+      // Must be static for Phase-1.
       if (M < 0 || N < 0 || K_a < 0 || K_b < 0 || M_c < 0 || N_c < 0) {
-        fail("Phase-0 NPU requires static shapes");
+        fail("NPU requires static shapes");
         return;
       }
-
       if (K_a != K_b) {
         fail("K dimension mismatch");
         return;
@@ -80,57 +89,65 @@ struct LowerMatmulToNPUPass
         return;
       }
 
-      // Check hardware constraints: 8xKx8.
-      if (M != kTileM || N != kTileN) {
-        fail("Unsupported matmul tile: only 8xKx8 supported in Phase-0");
-        return;
-      }
-      if ((K_a % kKGranularity) != 0) {
-        fail("Unsupported K: must be multiple of 8 in Phase-0");
-        return;
+      // Hardware constraint: ONLY 8x8x8.
+      if (M != kM || N != kN || K_a != kK) {
+        // Not an error: just skip non-matching matmuls (so the rest of the model still compiles).
+        // If you want strict behavior, replace with fail(...).
+        continue;
       }
 
-      // Check element types: i8 x i8 -> i16 (your description).
-      Type aElem = aTy.getElementType();
-      Type bElem = bTy.getElementType();
-      Type cElem = cTy.getElementType();
-
-      auto aInt = dyn_cast<IntegerType>(aElem);
-      auto bInt = dyn_cast<IntegerType>(bElem);
-      auto cInt = dyn_cast<IntegerType>(cElem);
-
+      // Types: i8 x i8 -> i16 (accum tensor element type).
+      auto aInt = dyn_cast<IntegerType>(aTy.getElementType());
+      auto bInt = dyn_cast<IntegerType>(bTy.getElementType());
+      auto cInt = dyn_cast<IntegerType>(cTy.getElementType());
       if (!aInt || !bInt || !cInt) {
-        op.emitError("Phase-0 NPU expects integer element types");
+        op.emitError("NPU expects integer element types");
         signalPassFailure();
         return;
       }
       if (aInt.getWidth() != 8 || bInt.getWidth() != 8 || cInt.getWidth() != 16) {
         op.emitError()
-            << "Phase-0 NPU expects i8 x i8 -> i16, got "
-            << aElem << " x " << bElem << " -> " << cElem;
+            << "NPU expects i8 x i8 -> i16, got "
+            << aTy.getElementType() << " x " << bTy.getElementType()
+            << " -> " << cTy.getElementType();
         signalPassFailure();
         return;
       }
 
-      // (Optional) signedness in MLIR IntegerType is signless; you can enforce
-      // your ABI later. For Phase 0, we treat i8 as "your int8".
+      // ---- Rewrite: linalg.matmul -> func.call @npu.matmul_8x8x8 ----
+      OpBuilder b(op);
+      auto calleeName = StringRef("npu.matmul_8x8x8");
 
-      // “Dispatch record” – we only print for now.
-      // This is the key: you now have a compiler-recognized operation.
-      llvm::outs()
-          << "NPU_DISPATCH: op=matmul_8xKx8"
-          << " K=" << K_a
-          << " bram_width_bits=" << kBramWidthBits
-          << " act_row_bytes=" << (kTileM * 1)   // 8 * int8
-          << " wgt_row_bytes=" << (kTileN * 1)   // 8 * int8 (per col, but same bytes)
-          << "\n";
-    });
+      // Declare the callee if it doesn't exist.
+      if (!module.lookupSymbol<func::FuncOp>(calleeName)) {
+        OpBuilder mb(module.getBodyRegion());
+        mb.setInsertionPointToEnd(module.getBody());
+        auto fnType = mb.getFunctionType({aTy, bTy}, {cTy});
+        auto decl = mb.create<func::FuncOp>(op.getLoc(), calleeName, fnType);
+        decl.setPrivate();
+      }
+
+      auto call = b.create<func::CallOp>(
+          op.getLoc(), calleeName, TypeRange{cTy},
+          ValueRange{op.getInputs()[0], op.getInputs()[1]});
+
+      // linalg.matmul returns a tensor result. Replace it with call result.
+      op.getResult(0).replaceAllUsesWith(call.getResult(0));
+
+      // Remove the linalg.matmul op.
+      op.erase();
+
+      // Optional: log once per rewrite.
+      llvm::errs()
+          << "NPU_REWRITE: linalg.matmul -> call @" << calleeName
+          << " (8x8x8, bram_width_bits=" << kBramWidthBits << ")\n";
+      llvm::errs().flush();
+    }
   }
 };
 
 }  // namespace
 
-// Public registration hook used by npu-opt.cpp
 void registerLowerMatmulToNPUPass() {
   PassRegistration<LowerMatmulToNPUPass>();
 }
