@@ -130,10 +130,83 @@ Expected:
 
 ---
 
-# What This Demonstrates
+---
 
-• Custom preprocessing pass is registered  
-• `linalg.matmul` is intercepted  
-• Rewritten to `@npu.matmul_8x8x8`  
+## 8️⃣ Generate Deployable VM Bytecode (.vmfb) + Runtime Flow
+
+The real deployable artifact for runtime is the VM bytecode file.
+
+```bash
+$IREE_BUILD/tools/iree-compile \
+  /tmp/test.mlir \
+  --iree-preprocessing-pass-pipeline="builtin.module(lower-matmul-to-npu)" \
+  --iree-hal-target-device=local \
+  --iree-hal-local-target-device-backends=vmvx \
+  -o /tmp/model.vmfb
+```
+
+This produces:
+
+```
+/tmp/model.vmfb
+```
+
+The `.vmfb` contains:
+- VM bytecode
+- `vm.call @npu.matmul_8x8x8`
+- `vm.import @npu.matmul_8x8x8`
+
+---
+
+### Runtime Integration Model
+
+At runtime:
+
+1. IREE loads `model.vmfb`
+2. VM executes `vm.call @npu.matmul_8x8x8`
+3. VM resolves `vm.import @npu.matmul_8x8x8`
+4. Runtime must provide a native C function with the same symbol name
+5. That C function:
+   - Extracts raw buffer pointers from `!hal.buffer_view`
+   - Converts to physical addresses (if needed)
+   - Calls ARM + FPGA GEMM kernel
+   - Wraps output into a buffer view
+   - Returns to VM
+
+---
+
+### End-to-End Architecture
+
+```
+linalg.matmul
+      ↓
+lower-matmul-to-npu (MLIR preprocessing pass)
+      ↓
+func.call @npu.matmul_8x8x8
+      ↓
+vm.import @npu.matmul_8x8x8
+      ↓
+model.vmfb
+      ↓
+IREE Runtime
+      ↓
+C binding function
+      ↓
+ARM driver
+      ↓
+FPGA 8×8 systolic NPU
+```
+
+---
+
+### What This Demonstrates
+
+• Custom preprocessing pass registered  
+• `linalg.matmul` intercepted  
+• Rewritten to hardware-specific ABI  
 • Rewrite survives full IREE lowering  
-• VM import generated (ready for runtime binding)
+• VM import automatically generated  
+• `.vmfb` is deployable artifact  
+• Ready for backend C binding  
+
+This completes the compiler → VM → runtime → hardware pipeline.
